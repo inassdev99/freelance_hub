@@ -1,0 +1,848 @@
+<?php
+require_once '../config.php';
+
+if (!estConnecte() || !isset($_SESSION['user_type']) || $_SESSION['user_type'] != 'client') {
+    rediriger('login.php');
+}
+
+$user_id = $_SESSION['user_id'];
+
+// Actions : accepter, refuser, ou faire une contre-offre
+$action = isset($_GET['action']) ? securiser($_GET['action']) : '';
+$proposition_id = isset($_GET['id']) ? intval($_GET['id']) : 0;
+$negociation_id = isset($_GET['negociation_id']) ? intval($_GET['negociation_id']) : 0;
+
+$error = '';
+$success = '';
+
+if ($action && $proposition_id > 0) {
+    try {
+        if ($action == 'accepter') {
+            // Récupérer la proposition et la dernière négociation
+            $stmt = $conn->prepare("SELECT p.*, i.titre, i.description, i.client_id,
+                                   n.prix_propose as dernier_prix, n.message as dernier_message
+                                   FROM propositions p 
+                                   JOIN idees i ON p.idee_id = i.id
+                                   LEFT JOIN (SELECT * FROM negociations WHERE proposition_id = ? ORDER BY id DESC LIMIT 1) n ON 1=1
+                                   WHERE p.id = ? AND i.client_id = ?");
+            $stmt->execute([$proposition_id, $proposition_id, $user_id]);
+            $proposition = $stmt->fetch();
+            
+            if ($proposition) {
+                $prix_final = $proposition['dernier_prix'] ?: $proposition['prix_propose'];
+                
+                // Créer un projet
+                $stmt = $conn->prepare("INSERT INTO projets (freelancer_id, client_id, titre, description, prix, statut, proposition_id) 
+                                       VALUES (?, ?, ?, ?, ?, 'en_cours', ?)");
+                $stmt->execute([
+                    $proposition['freelancer_id'],
+                    $proposition['client_id'],
+                    $proposition['titre'],
+                    $proposition['description'],
+                    $prix_final,
+                    $proposition_id
+                ]);
+                
+                // Mettre à jour la proposition
+                $stmt = $conn->prepare("UPDATE propositions SET statut = 'accepte', prix_final = ? WHERE id = ?");
+                $stmt->execute([$prix_final, $proposition_id]);
+                
+                // Mettre à jour l'idée
+                $stmt = $conn->prepare("UPDATE idees SET statut = 'accepte' WHERE id = ?");
+                $stmt->execute([$proposition['idee_id']]);
+                
+                // Refuser les autres propositions pour cette idée
+                $stmt = $conn->prepare("UPDATE propositions SET statut = 'refuse' 
+                                       WHERE idee_id = ? AND id != ?");
+                $stmt->execute([$proposition['idee_id'], $proposition_id]);
+                
+                // Mettre à jour les négociations
+                $stmt = $conn->prepare("UPDATE negociations SET statut = 'accepte' 
+                                       WHERE proposition_id = ? AND statut = 'en_attente'");
+                $stmt->execute([$proposition_id]);
+                
+                $success = "Proposition acceptée ! Un projet a été créé.";
+            }
+        } elseif ($action == 'refuser') {
+            $stmt = $conn->prepare("UPDATE propositions p 
+                                   JOIN idees i ON p.idee_id = i.id 
+                                   SET p.statut = 'refuse' 
+                                   WHERE p.id = ? AND i.client_id = ?");
+            $stmt->execute([$proposition_id, $user_id]);
+            
+            $success = "Proposition refusée.";
+            
+        } elseif ($action == 'faire_offre' && $negociation_id > 0) {
+            // Traiter une contre-offre du client
+            $nouveau_prix = floatval($_POST['nouveau_prix']);
+            $message = securiser($_POST['message']);
+            
+            if ($nouveau_prix <= 0) {
+                $error = "Veuillez entrer un prix valide.";
+            } else {
+                // Mettre à jour l'ancienne négociation
+                $stmt = $conn->prepare("UPDATE negociations SET statut = 'traite' WHERE id = ?");
+                $stmt->execute([$negociation_id]);
+                
+                // Créer une nouvelle offre du client
+                $stmt = $conn->prepare("INSERT INTO negociations 
+                                      (proposition_id, type, prix_propose, message, statut, date_creation) 
+                                      VALUES (?, 'offre_client', ?, ?, 'en_attente', NOW())");
+                $stmt->execute([$proposition_id, $nouveau_prix, $message]);
+                
+                $success = "Votre contre-offre a été envoyée au freelancer !";
+            }
+        } elseif ($action == 'accepter_negociation' && $negociation_id > 0) {
+            // Accepter une offre du freelancer
+            $stmt = $conn->prepare("SELECT n.*, p.freelancer_id, p.idee_id 
+                                   FROM negociations n
+                                   JOIN propositions p ON n.proposition_id = p.id
+                                   JOIN idees i ON p.idee_id = i.id
+                                   WHERE n.id = ? AND i.client_id = ?");
+            $stmt->execute([$negociation_id, $user_id]);
+            $negociation = $stmt->fetch();
+            
+            if ($negociation) {
+                // Mettre à jour la négociation
+                $stmt = $conn->prepare("UPDATE negociations SET statut = 'accepte' WHERE id = ?");
+                $stmt->execute([$negociation_id]);
+                
+                // Mettre à jour la proposition
+                $stmt = $conn->prepare("UPDATE propositions SET statut = 'accepte', prix_final = ? WHERE id = ?");
+                $stmt->execute([$negociation['prix_propose'], $negociation['proposition_id']]);
+                
+                // Créer un projet
+                $stmt = $conn->prepare("INSERT INTO projets (freelancer_id, client_id, titre, description, prix, statut, proposition_id) 
+                                       SELECT p.freelancer_id, i.client_id, i.titre, i.description, n.prix_propose, 'en_cours', p.id
+                                       FROM negociations n
+                                       JOIN propositions p ON n.proposition_id = p.id
+                                       JOIN idees i ON p.idee_id = i.id
+                                       WHERE n.id = ?");
+                $stmt->execute([$negociation_id]);
+                
+                // Mettre à jour l'idée
+                $stmt = $conn->prepare("UPDATE idees SET statut = 'accepte' WHERE id = ?");
+                $stmt->execute([$negociation['idee_id']]);
+                
+                // Refuser les autres propositions pour cette idée
+                $stmt = $conn->prepare("UPDATE propositions SET statut = 'refuse' 
+                                       WHERE idee_id = ? AND id != ?");
+                $stmt->execute([$negociation['idee_id'], $negociation['proposition_id']]);
+                
+                $success = "Offre acceptée ! Un projet a été créé.";
+            }
+        }
+    } catch(PDOException $e) {
+        $error = "Erreur : " . $e->getMessage();
+    }
+}
+
+try {
+    // Récupérer les propositions pour mes idées
+    $stmt = $conn->prepare("SELECT p.*, i.titre as idee_titre, i.budget as budget_client, 
+                           f.nom as freelancer_nom, f.email as freelancer_email,
+                           CASE 
+                               WHEN p.statut = 'en_attente' THEN '⏳ En attente'
+                               WHEN p.statut = 'accepte' THEN '✅ Acceptée'
+                               WHEN p.statut = 'refuse' THEN '❌ Refusée'
+                               WHEN p.statut = 'annule' THEN '❌ Annulée'
+                           END as statut_texte
+                           FROM propositions p
+                           JOIN idees i ON p.idee_id = i.id
+                           JOIN freelancers f ON p.freelancer_id = f.id
+                           WHERE i.client_id = ?
+                           ORDER BY p.date_creation DESC");
+    $stmt->execute([$user_id]);
+    $propositions = $stmt->fetchAll();
+    
+    // Pour chaque proposition, récupérer les négociations et déterminer la dernière offre
+    foreach ($propositions as &$proposition) {
+        $stmt = $conn->prepare("SELECT * FROM negociations 
+                               WHERE proposition_id = ? 
+                               ORDER BY date_creation ASC");
+        $stmt->execute([$proposition['id']]);
+        $proposition['negociations'] = $stmt->fetchAll();
+        
+        // Trouver la dernière offre en attente
+        $proposition['derniere_offre'] = null;
+        $proposition['derniere_offre_freelancer'] = null;
+        
+        foreach (array_reverse($proposition['negociations']) as $neg) {
+            if ($neg['statut'] == 'en_attente') {
+                $proposition['derniere_offre'] = $neg;
+                if (strpos($neg['type'], 'freelancer') !== false) {
+                    $proposition['derniere_offre_freelancer'] = $neg;
+                }
+                break;
+            }
+        }
+        
+        // Si pas d'offre en attente, prendre la dernière négociation du freelancer
+        if (!$proposition['derniere_offre_freelancer'] && count($proposition['negociations']) > 0) {
+            foreach (array_reverse($proposition['negociations']) as $neg) {
+                if (strpos($neg['type'], 'freelancer') !== false) {
+                    $proposition['derniere_offre_freelancer'] = $neg;
+                    break;
+                }
+            }
+        }
+        
+        // Déterminer le prix et message à afficher
+        if ($proposition['derniere_offre_freelancer']) {
+            $proposition['prix_a_afficher'] = $proposition['derniere_offre_freelancer']['prix_propose'];
+            $proposition['message_a_afficher'] = $proposition['derniere_offre_freelancer']['message'];
+        } else {
+            $proposition['prix_a_afficher'] = $proposition['prix_propose'];
+            $proposition['message_a_afficher'] = $proposition['message'];
+        }
+    }
+    
+} catch(PDOException $e) {
+    die("Erreur : " . $e->getMessage());
+}
+?>
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mes propositions - FreelanceHub</title>
+    <style>
+        /* VOTRE CSS EXACT TEL QUEL */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: Arial, sans-serif;
+        }
+
+        body {
+            background-color: #f5f5f5;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+
+        /* Header */
+        .header {
+            background: white;
+            padding: 15px 0;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .navbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-size: 24px;
+            font-weight: bold;
+            color: #4361ee;
+            text-decoration: none;
+        }
+
+        .nav-menu {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+
+        .nav-menu a {
+            color: #333;
+            text-decoration: none;
+        }
+
+        /* Buttons */
+        .btn {
+            padding: 10px 20px;
+            border-radius: 5px;
+            text-decoration: none;
+            border: none;
+            cursor: pointer;
+        }
+
+        .btn-primary {
+            background: #4361ee;
+            color: white;
+        }
+
+        .btn-secondary {
+            background: #7209b7;
+            color: white;
+        }
+
+        .btn-outline {
+            background: transparent;
+            border: 2px solid #4361ee;
+            color: #4361ee;
+        }
+
+        /* Hero */
+        .hero {
+            background: #4361ee;
+            color: white;
+            padding: 100px 0;
+            text-align: center;
+        }
+
+        .hero h1 {
+            font-size: 36px;
+            margin-bottom: 20px;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            margin-top: 30px;
+        }
+
+        /* Forms */
+        .form-container {
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            max-width: 500px;
+            margin: 100px auto;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+        }
+
+        .form-group input,
+        .form-group textarea,
+        .form-group select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+
+        /* Tables */
+        .table-container {
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 30px 0;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            padding: 15px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+
+        th {
+            background: #f8f9fa;
+            font-weight: bold;
+        }
+
+        /* Dashboard */
+        .dashboard-stats {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
+            margin: 30px 0;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+
+        /* Alerts */
+        .alert {
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+
+        .alert-error {
+            background: #ffebee;
+            color: #c62828;
+            border: 1px solid #ffcdd2;
+        }
+
+        .alert-success {
+            background: #e8f5e9;
+            color: #2e7d32;
+            border: 1px solid #c8e6c9;
+        }
+
+        /* Footer */
+        .footer {
+            background: #333;
+            color: white;
+            padding: 50px 0;
+            text-align: center;
+            margin-top: 100px;
+        }
+        
+        /* Styles supplémentaires pour cette page */
+        .nav-active {
+            color: #4361ee;
+            font-weight: bold;
+        }
+        
+        main {
+            margin-top: 80px;
+        }
+        
+        h1 {
+            margin-bottom: 30px;
+            color: #333;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 10px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+        
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 20px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #eee;
+        }
+        
+        .card-title {
+            font-size: 20px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 10px;
+        }
+        
+        .price-comparison {
+            display: flex;
+            gap: 20px;
+            margin: 20px 0;
+        }
+        
+        .price-item {
+            flex: 1;
+            padding: 20px;
+            border-radius: 5px;
+            text-align: center;
+        }
+        
+        .client-price {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+        }
+        
+        .freelancer-price {
+            background: #e8f4fd;
+            border: 1px solid #cce5ff;
+        }
+        
+        .price-number {
+            font-size: 24px;
+            font-weight: bold;
+            color: #333;
+            margin: 10px 0;
+        }
+        
+        .freelancer-price .price-number {
+            color: #4361ee;
+        }
+        
+        .message-container {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+        }
+        
+        .offer-form {
+            background: #fff3cd;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 5px;
+            border-left: 4px solid #ffc107;
+        }
+        
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+        
+        .actions {
+            display: flex;
+            gap: 15px;
+            margin-top: 20px;
+        }
+        
+        .btn {
+            display: inline-block;
+            text-align: center;
+            font-weight: 600;
+        }
+        
+        .btn-success {
+            background: #28a745;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        
+        .btn-warning {
+            background: #ffc107;
+            color: #212529;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            background: white;
+            border-radius: 10px;
+            color: #666;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+        
+        .empty-state h3 {
+            margin-bottom: 10px;
+        }
+        
+        .negotiation-timeline {
+            margin: 20px 0;
+        }
+        
+        .timeline-item {
+            display: flex;
+            margin-bottom: 15px;
+        }
+        
+        .timeline-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 15px;
+            background: #4361ee;
+            color: white;
+            font-weight: bold;
+        }
+        
+        .client-icon {
+            background: #7209b7;
+        }
+        
+        .timeline-content {
+            flex: 1;
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+        }
+        
+        .price-badge {
+            display: inline-block;
+            padding: 5px 10px;
+            background: white;
+            border-radius: 20px;
+            font-weight: bold;
+            margin: 5px 0;
+            border: 1px solid #ddd;
+        }
+        
+        @media (max-width: 768px) {
+            .form-row {
+                grid-template-columns: 1fr;
+            }
+            
+            .price-comparison {
+                flex-direction: column;
+            }
+            
+            .actions {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="container">
+            <nav class="navbar">
+                <a href="../index.php" class="logo">FreelanceHub</a>
+                <div class="nav-menu">
+                    <a href="dashboard.php">Tableau de bord</a>
+                    <a href="mes_propositions.php">Mes propositions</a>
+                </div>
+            </nav>
+        </div>
+    </header>
+
+    <main class="container"><br>
+        <h1>Mes propositions reçues</h1>
+        
+        <?php if ($success): ?>
+            <div class="alert alert-success"><?php echo $success; ?></div>
+        <?php endif; ?>
+        
+        <?php if ($error): ?>
+            <div class="alert alert-error"><?php echo $error; ?></div>
+        <?php endif; ?>
+        
+        <?php if (count($propositions) > 0): ?>
+            <?php foreach ($propositions as $proposition): ?>
+            <div class="card">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title"><?php echo $proposition['idee_titre']; ?></div>
+                        <div style="color: #666; font-size: 14px;">
+                            Proposition de <strong><?php echo $proposition['freelancer_nom']; ?></strong>
+                            (<?php echo $proposition['freelancer_email']; ?>)
+                        </div>
+                    </div>
+                    <div style="text-align: right;">
+                        <div style="font-size: 14px; color: #666;">
+                            <?php echo date('d/m/Y H:i', strtotime($proposition['date_creation'])); ?>
+                        </div>
+                        <div style="margin-top: 5px; font-weight: bold;">
+                            <?php echo $proposition['statut_texte']; ?>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Comparaison des prix -->
+                <?php if ($proposition['budget_client']): ?>
+                <div class="price-comparison">
+                    <div class="price-item client-price">
+                        <div style="font-size: 14px; color: #666;">Votre budget</div>
+                        <div class="price-number"><?php echo $proposition['budget_client']; ?> MAD</div>
+                    </div>
+                    
+                    <div class="price-item freelancer-price">
+                        <div style="font-size: 14px; color: #666;">
+                            <?php echo $proposition['derniere_offre_freelancer'] ? 'Dernière offre' : 'Proposition initiale'; ?>
+                        </div>
+                        <div class="price-number"><?php echo $proposition['prix_a_afficher']; ?> MAD</div>
+                    </div>
+                </div>
+                <?php endif; ?>
+                
+                <!-- Message du freelancer -->
+                <div class="message-container">
+                    <strong>Message du freelancer :</strong><br>
+                    <?php 
+                    if (!empty($proposition['message_a_afficher'])) {
+                        echo nl2br($proposition['message_a_afficher']);
+                    } else {
+                        echo "<em>Aucun message fourni</em>";
+                    }
+                    ?>
+                </div>
+                
+                <!-- Historique des négociations -->
+                <?php if (count($proposition['negociations']) > 0): ?>
+                <h4>Historique des négociations</h4>
+                <div class="negotiation-timeline">
+                    <?php foreach ($proposition['negociations'] as $neg): ?>
+                    <div class="timeline-item">
+                        <div class="timeline-icon <?php echo strpos($neg['type'], 'client') !== false ? 'client-icon' : ''; ?>">
+                            <?php echo strpos($neg['type'], 'client') !== false ? 'C' : 'F'; ?>
+                        </div>
+                        <div class="timeline-content">
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                                <strong>
+                                    <?php echo strpos($neg['type'], 'client') !== false ? 'Vous' : 'Freelancer'; ?>
+                                </strong>
+                                <small style="color: #666;"><?php echo date('d/m/Y H:i', strtotime($neg['date_creation'])); ?></small>
+                            </div>
+                            
+                            <div class="price-badge"><?php echo $neg['prix_propose']; ?> MAD</div>
+                            
+                            <?php if ($neg['message']): ?>
+                                <p style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #ddd;">
+                                    <?php echo nl2br($neg['message']); ?>
+                                </p>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                    <?php endforeach; ?>
+                </div>
+                <?php endif; ?>
+                
+                <!-- Actions selon le statut -->
+                <?php if ($proposition['statut'] == 'en_attente'): ?>
+                    <?php if ($proposition['derniere_offre'] && $proposition['derniere_offre']['type'] == 'offre_freelancer'): ?>
+                        <!-- Répondre à une offre du freelancer -->
+                        <div class="offer-form">
+                            <h4>Répondre à l'offre du freelancer</h4>
+                            <p><strong>Dernière offre :</strong> <?php echo $proposition['derniere_offre']['prix_propose']; ?> MAD</p>
+                            
+                            <form method="POST" action="?action=faire_offre&id=<?php echo $proposition['id']; ?>&negociation_id=<?php echo $proposition['derniere_offre']['id']; ?>">
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>Votre contre-offre (MAD) *</label>
+                                        <input type="number" name="nouveau_prix" 
+                                               step="0.01" min="0.01" required 
+                                               value="<?php echo $proposition['derniere_offre']['prix_propose'] * 0.9; ?>">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Délai souhaité (jours)</label>
+                                        <input type="number" name="delai" min="1" value="14">
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Votre message</label>
+                                    <textarea name="message" rows="3" required 
+                                              placeholder="Expliquez votre contre-offre..."></textarea>
+                                </div>
+                                
+                                <div class="actions">
+                                    <button type="submit" class="btn btn-primary">
+                                        Envoyer la contre-offre
+                                    </button>
+                                    <a href="?action=accepter_negociation&id=<?php echo $proposition['id']; ?>&negociation_id=<?php echo $proposition['derniere_offre']['id']; ?>" 
+                                       class="btn btn-success"
+                                       onclick="return confirm('Accepter cette offre et créer un projet ?')">
+                                        Accepter cette offre
+                                    </a>
+                                    <a href="?action=refuser&id=<?php echo $proposition['id']; ?>" 
+                                       class="btn btn-outline"
+                                       onclick="return confirm('Refuser cette proposition ?')">
+                                        Refuser la proposition
+                                    </a>
+                                </div>
+                            </form>
+                        </div>
+                    <?php else: ?>
+                        <!-- Proposition initiale sans négociation -->
+                        <div class="actions">
+                            <a href="?action=accepter&id=<?php echo $proposition['id']; ?>" 
+                               class="btn btn-primary"
+                               onclick="return confirm('Accepter cette proposition et créer un projet ?')">
+                                Accepter la proposition
+                            </a>
+                            
+                            <!-- Formulaire de contre-offre -->
+                            <button type="button" class="btn btn-warning" 
+                                    onclick="document.getElementById('counter-offre-<?php echo $proposition['id']; ?>').style.display='block'">
+                                Faire une contre-offre
+                            </button>
+                            
+                            <a href="?action=refuser&id=<?php echo $proposition['id']; ?>" 
+                               class="btn btn-outline"
+                               onclick="return confirm('Refuser cette proposition ?')">
+                                Refuser
+                            </a>
+                        </div>
+                        
+                        <!-- Formulaire caché pour contre-offre initiale -->
+                        <div id="counter-offre-<?php echo $proposition['id']; ?>" 
+                             style="display: none; margin-top: 20px; padding: 20px; background: #f8f9fa; border-radius: 5px;">
+                            <h4>Faire une contre-offre</h4>
+                            <form method="POST" action="?action=faire_offre&id=<?php echo $proposition['id']; ?>">
+                                <input type="hidden" name="negociation_id" value="0">
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>Votre prix proposé (MAD) *</label>
+                                        <input type="number" name="nouveau_prix" 
+                                               step="0.01" min="0.01" required 
+                                               value="<?php echo $proposition['prix_a_afficher'] * 0.9; ?>">
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Délai souhaité (jours)</label>
+                                        <input type="number" name="delai" min="1" value="14">
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label>Votre message *</label>
+                                    <textarea name="message" rows="3" required 
+                                              placeholder="Expliquez votre contre-offre..."></textarea>
+                                </div>
+                                
+                                <div class="actions">
+                                    <button type="submit" class="btn btn-primary">
+                                        Envoyer la contre-offre
+                                    </button>
+                                    <button type="button" class="btn btn-outline" 
+                                            onclick="document.getElementById('counter-offre-<?php echo $proposition['id']; ?>').style.display='none'">
+                                        Annuler
+                                    </button>
+                                </div>
+                            </form>
+                        </div>
+                    <?php endif; ?>
+                    
+                <?php elseif ($proposition['statut'] == 'accepte'): ?>
+                    <div class="alert alert-success">
+                        Cette proposition a été acceptée et un projet a été créé.
+                        <?php if ($proposition['prix_final']): ?>
+                            <br><strong>Prix final :</strong> <?php echo $proposition['prix_final']; ?> MAD
+                        <?php endif; ?>
+                        <br>
+                        <a href="projet.php?id=<?php echo $proposition['id']; ?>" class="btn btn-primary" style="margin-top: 10px;">
+                            Voir le projet
+                        </a>
+                    </div>
+                <?php else: ?>
+                    <div class="alert alert-error">
+                        Cette proposition a été refusée.
+                    </div>
+                <?php endif; ?>
+            </div>
+            <?php endforeach; ?>
+        <?php else: ?>
+            <div class="empty-state">
+                <h3>Aucune proposition reçue</h3>
+                <p>Vous n'avez pas encore reçu de proposition pour vos idées.</p><br>
+                <a href="ajouter_idee.php" class="btn btn-primary">Créer une nouvelle idée</a>
+            </div>
+        <?php endif; ?>
+        
+        <div style="margin-top: 30px;">
+            <a href="dashboard.php" class="btn btn-outline">← Retour au tableau de bord</a>
+        </div>
+    </main>
+    
+    <script>
+        function toggleCounterOffer(id) {
+            const form = document.getElementById('counter-offre-' + id);
+            if (form) {
+                form.style.display = form.style.display === 'none' ? 'block' : 'none';
+            }
+        }
+    </script>
+</body>
+</html>
