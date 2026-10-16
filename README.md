@@ -10,7 +10,7 @@ Le projet propose trois espaces : **Client**, **Freelancer** et **Administration
 
 ## 🖼️ Aperçu de la plateforme
 
-![Page d’accueil FreelanceHub](images/accueil.png)
+![Page d’accueil FreelanceHub]![docs/FreelanceHub.png](docs/FreelanceHub.png)
 
 ---
 
